@@ -1,0 +1,1095 @@
+---
+title: "GMLAmodified"
+author: "KATE SANBORN"
+date: "11/17/2021"
+output: word_document
+---
+
+This code refers to the Gradient Maximum Likelihood Algorithm from the Paluch paper:
+"Fast and accurate detection of spread source in large complex networks"
+
+The big idea is that they assume a SI model and that propagation times are normally 
+distributed with known mu and sigma.
+
+Shah & Zaman use a BFS method and assign rumor centrality as a means of picking the 
+source.
+PTVA relaxes the assumptions of Shah & Zaman by using a set of observers and not every node.
+
+GMLaA further relaxes assumptions and reduces computational complexity through
+subsetting the set of randomly chosen observers to k0. 
+
+GMLA is sensitive to number k0 chosen so that is a parameter that can be tuned.
+They actually study the number k0 versus precision and assert that:
+k0 = 0.5 *sqrt(N) where N is the number of nodes in the network.
+"Enhancing MLE 2021" paper follow-up to their previous paper.
+
+
+Some tasks to prepare for the algorithm:
+-obtain a network of nodes and edges
+-simulate SI model on the network they use infection rate Beta = 0.5 (prop ratio lambda = sqrt(2))
+-prop ratio uses known mu and sigma: lambda = mu/sig
+-randomly select observers K in network (they use density rho =0.2)
+-sort observers by observed delays after prop ratio assigned
+-leave k0 observers after sort
+-select one observer as reference
+-compute vector of observed relative delays
+-initialize suspected source vector S
+-initialize vector v (first observer with initial score =0)
+-initialize max score = 0 at start
+-enter while loop
+-take observer one from sorted list and look at its neighbors
+-form a diffusion tree via BFS from neighbor n to the other k0
+-compute mu vector which takes in length of shortest path to the k0
+-compute capt. lambda matrix 
+-compute score
+-pick neighbor with highest score
+-look at its neighbors. do the same thing
+
+
+Recall The waiting time for a transmission across a particular edge is modeled by an exponential random variable with mean
+1/β. Where we set B = 0.5 . The authors assume that the probability of infection is basically a coin flip.
+
+lambda = mu/sd = 1/sqrt(1-beta).
+
+They use lambda=sqrt(2) or beta=0.5.
+
+First we need to simulate this propagation. Fortunately, Jake Fisher with Duke ran through this
+
+```{r}
+library(statnet)
+library(tidyverse)
+library(magrittr)
+library(ggnetwork)
+
+# Dedicated diffusion packages
+library(EpiModel)
+library(netdiffuseR)
+library(igraph)
+library(ggraph)
+
+#this simulation code is pulled from https://sites.duke.edu/dnac/diffusion-simulations/
+##### Example 1: Disease epidemics ####
+# The most straightforward and common use for a diffusion simulation is to
+# simulate an epidemic spreading through a population.  Some examples of this
+# include:
+# Moody, James. 2002. "The Importance of Relationship Timing for Diffusion." 
+#      Social Forces 81(1):25-56.
+# Merli, M.Giovanna, James Moody, Joshua Mendelsohn, and Robin Gauthier. 2015.
+#      "Sexual Mixing in Shanghai: Are Heterosexual Contact Patterns Compatible 
+#      With an HIV/AIDS Epidemic?" Demography 52(3):919-42.
+
+# In the example here, we will simulate an epidemic spreading through a random
+# network.  This roughly approximates a "random mixing" scenario, where people
+# interact randomly.
+
+# To simulate random mixing, we construct the following rules:
+# 1. Set up a world with a fixed number of people and a small fraction of 
+#    initial infections, arranged randomly as a network
+# 2. Pick an edge at random
+# 3. If the edge is discordant (a susceptible-infected connection), flip a coin
+#    to determine whether the non-infected person gets infected
+# 4. Repeat steps 1 and 2 until everyone is infected, or until a certain number
+#    of steps has passed
+
+# First, in our simple example, let's set our parameters ahead of time
+n.people <- 100
+N=100
+p.infection <- 0.5
+pct.starting.infected <- 0.01
+max.time <- 5000
+contact.rate <- 0.05 / 2  # prob. of contact between any 2 people in the network
+
+### Step 1: Set up world ###
+# Create a random graph, where edges are placed randomly.  This is called a
+# Bernoulli or an Erdos-Renyi random graph
+set.seed(919)
+net <- rgraph(n = n.people, tprob = contact.rate) %>%
+  symmetrize %>%  # Make symmetric -- doesn't matter who is connected to who
+  network(matrix.type = "adjacency")  # convert to statnet
+library(shp2graph)
+
+# Chose a subset of people who are infected initially
+infected <- sample(
+  x = c(T, F),      # people can be infected (T) or susceptible (F)
+  size = n.people,  # create a vector that is n.people long
+  replace = T,      # with replacement, so that >1 person can be infected
+  prob = c(pct.starting.infected, 1 - pct.starting.infected)
+  )
+
+infected
+
+#looks like node 69 is true source
+
+
+
+### Step 2: Choose an edge ###
+# For each step, we're going to choose an edge at random, and then, if the edge
+# is discordant, flip a coin to determine whether the susceptible person gets
+# infected.
+
+# First, create an edgelist...
+el <- as.edgelist(net) %>%
+  as.data.frame %>%
+  set_names(value = c("from", "to")) %>%
+  
+  # ... attach the values of infected...
+  mutate(from.infected = infected[from], to.infected = infected[to],
+         
+         # ... and create a discordant variable
+         discordant = (from.infected != to.infected))
+
+# Next, choose an edge at random
+random.edge <- sample(nrow(el), size = 1)
+
+# Check if the edge is discordant
+el[random.edge, "discordant"]  # it's not, so we do nothing.
+
+# For the example, I'm going to speed this up by choosing a discordant edge
+discordant.edge <- sample(which(el$discordant), size = 1)
+
+### Step 3: Flip a coin to see if the person gets infected ###
+
+# Now, flip a coin to see if the uninfected person gets infected
+el[discordant.edge, ]  # Person 62 is the suceptible, but we will want to be
+                       # able to determine that without looking manually
+
+# A little tricky indexing to pull out the ID of the susceptible person...
+who.susceptible <- with(
+  el[discordant.edge, ],
+  c(from, to)[!c(from.infected, to.infected)]
+  )
+
+# Flip the coin to determine if infection spreads (it does)
+(infected[who.susceptible] <- sample(c(T, F), size = 1, 
+                                    prob = c(p.infection, 1 - p.infection)))
+
+### Step 4: Repeat ###
+# To repeat this process, we actually embed steps 1 and 2 in a loop.
+
+# Set up a list with the output
+infections <- vector(length = max.time, mode = "list")
+
+# Save what we already did as the first iteration
+infections[[1]] <- infected
+
+# Quick aside -- what did we create?
+head(infections)
+
+# Drop the "from.infected", "to.infected", and "discordant" columns from el,
+# because they'll actually change with every iteration
+el %<>% select(-from.infected, -to.infected, -discordant)
+
+# Next, run the loop
+
+for (t in 2:max.time) {
+  infections[[t]] <- infections[[t - 1]]
+  
+  # Pick an edge at random
+  random.edge <- sample(nrow(el), size = 1)
+  
+  # If the edge is discordant, flip a coin to decide if the infection spreads
+  if (with(el[random.edge, ], 
+           infections[[t]][from] != infections[[t]][to])) {
+    
+    who.susceptible <- with(
+      el[random.edge, ],
+      c(from, to)[!c(infections[[t]][from], infections[[t]][to])]
+      )
+    
+    infections[[t]][who.susceptible] <- sample(
+      c(T, F), 
+      size = 1, 
+      prob = c(p.infection, 1 - p.infection)
+    )
+  }
+}
+
+
+# Now we have a list of who was infected at what time point.  Let's combine
+# that into a data.frame, so we can work with it more easily
+(results <- infections %>%
+  lapply(FUN = as.data.frame) %>%
+  lapply(FUN = set_names, value = "infected") %>%
+  bind_rows(.id = "t") %>%
+  mutate(id = rep(1:network.size(net), times = max.time),
+         t = as.integer(t)) %>%
+  tbl_df)
+
+# This dataset is the raw results of our simulation, but it's usually easier to
+# look at a summary.  Let's look at the number of people infected over time
+infections.by.time <- results %>%
+  group_by(t) %>%
+  summarize(n.infections = sum(infected)) %>%
+  mutate_each(funs(as.numeric), t, n.infections)
+
+# Aside: in R, there are many ways to solve the same problem.  We could have
+# gone directly from the raw data to the summaries using the apply functions:
+# infections.by.time <- data.frame(
+#   t = 1:max.time,
+#   n.infected = sapply(infections, sum)
+# ) 
+
+# Plotting this relationship shows the 
+qplot(data = infections.by.time, x = t, y = n.infections, geom = "line")
+
+# Or, alternatively, we could look at whether people who are more central
+# are infected sooner
+time.to.infection <- results %>%
+  group_by(id) %>%
+  summarize(time.infected = min(t[infected])) %>%
+  arrange(id) #%>%
+  #mutate(indegc = degree(net))
+
+#now we have a table of delayed infection times relative to the first infection
+#and it is stored in time.to.infection
+
+time.to.infection
+min(time.to.infection$time.infected)
+```
+Now we have simulated data using B=0.5 and 100 nodes. We should note that the Duke simulation walk through 
+assigns Time of infection not a delay time, thus, we have two nodes with time infection =1 since the source node is infected in the first time window and infects someone in the first time window.
+
+So by examining the code we see that node 69 is assigned as the true source.
+Then node 62 is the first infected after 1 day (1 time window).
+So let's set delay times relative to node 69 (true source).
+
+```{r}
+time.to.infection$delay<-time.to.infection$time.infected
+time.to.infection$delay[69]<-0 #set true source to delay=0
+```
+
+
+
+We want to randomly
+select K observers from the network using a density =0.2
+
+```{r}
+k0= round(0.5 *sqrt(N),0) #5subobservers
+#so we need to select more than 5 initial observers. 
+#since we have a network of 100 nodes, let's choose sqrt(N)
+
+K<-round(sqrt(N),0) #10 observers
+
+#now pick 32 from network 
+## Create test and training sets
+set.seed(919) #same seed as before
+library(rsample)
+data_split <- initial_split(time.to.infection, prop = K/N)
+othernodes <- testing(data_split)
+observers <- training(data_split)
+
+```
+Now we sort observers by delay
+```{r}
+#now to set up the algorithm
+#1 sort all observers in ascending order of delays
+library(dplyr)
+
+sorted<-observers %>% arrange(delay)
+
+```
+step 2 leave only k0 of observers...these are nearest observers
+The optimal number of the nearest observers K0⁎ is the minimal number of the nearest observers K0 needed to achieve maximal quality of the spread source localization.
+
+```{r}
+#take top k0 closest observers. This is better than the 32 observers and trying to keep track of all
+
+subobs<-sorted[c(1:k0),]
+
+set.seed(919) #same seed
+#now pick a reference obs
+ref<-subobs[sample(nrow(subobs),size=1), ]
+
+```
+Now step 3 is select one observe as reference and label its arrival time as reference. Last line of code above.
+
+Step 4 is to compute a vector of observed delays relative to the reference's
+```{r}
+time.to.infection$diffdelay<-(time.to.infection$delay - ref$delay)
+subobs$diffdelay<-(subobs$delay - ref$delay)
+```
+
+Now to do steps 5-7 of initialization
+
+```{r}
+
+v<-subobs[1,] #observer 1 
+v$score<-0
+
+#initialize max score as 0
+maxscore<-0
+```
+
+Now to enter the main loop. We look at neighbors of v and create a BFS from its neighbors to each observer.
+We calculate the score for each neighbor which uses the mean delay and variance of delay and observed delay.
+
+```{r}
+#in order to use neighbors function in igraph, we need to convert our edgelist 
+#into an igraph 
+nett<-graph_from_edgelist(as.matrix(el),directed=T)
+plot.igraph(nett)
+
+#get neighbors of v
+neigh<-neighbors(nett,v$id,mode="out")
+#these are the neighbors of v
+neigh
+```
+Functions for calculating the score
+```{r}
+
+#let's make a score function for GMLA
+
+score<-function(muvec,covv,delayvec){
+  diff<-delayvec-muvec
+  numerator<-(-1/2)*t(diff)%*%solve(covv)%*%(diff)
+  denom<-sqrt(det(covv))
+  s<-exp((-1/2)*numerator)*(1/denom)
+  print(s)
+}
+
+```
+we should also prep to calculate the mu vector and covar matrix
+[µs]k = µ(|P(s, ok)| − |P(s, oK)|)
+[Λs]k,i = σ2|P(oK, ok) ∩ P(oK, oi)|
+
+```{r}
+computemu<-function(truemu, disttoobs,disttoref){
+  mu<-truemu*(abs(disttoobs)-abs(disttoref))
+}
+
+```
+
+Now let's walk through neighbor score calculations.
+We look at the neighbors of our first observer - ID NODE 62.
+
+Reference observer = ID 27
+
+
+neighbors OF NODE 62 are: 19,26,44,52,69,95,100 as given by the neighbors function.
+
+Now we want to perform a BFS rooted at each of these 7 nodes to the other k0 nodes.
+We need to store the length of path from root node to the observer and 
+the length of the path to the reference observer.
+
+This will help us form our mu vector for each neighbor (1 x #k0)
+So we will have n * (1 x k0) vectors from this step. 
+
+Capt lambda (Cov) is a matrix that uses the length of the path from the reference node to other observers.
+So it is a (k0-1) x (1-k0) matrix.
+
+We should also store the true mu and true sigma^2. Since we know that beta=0.5 was used
+Lambda= 1/sqrt(1-Beta) = sqrt(2) = mu/sigma. 
+
+Let's set mu = 1. This would set sigma = 1/sqrt(2) or sigma^2 = 0.5 = beta.
+```{r}
+trumu<-1
+sigma2<-0.5
+
+#first remove reference observer from the subobs matrix 
+library(Hmisc)
+subobs2<-subobs[subobs$id%nin%ref$id,]
+
+#now get shortest paths rooted at neighbors to each of the k0 observers
+numberofneighbors<-length(neigh)
+
+#store the shortest paths in a vector list
+l<-vector(mode="list")
+reff<-vector(mode="list") #shortest path to reference obs
+for(i in 1:numberofneighbors){
+#p[i]<-get.all.shortest.paths(ptnGoe, neigh[i], to = as.character(subobs$node))
+l[i]<-shortest_paths(nett, from=neigh[i],to=V(nett)%in%subobs2$id, output="vpath")
+reff[i]<-shortest_paths(nett, from=neigh[i],to=V(nett)%in%ref$id, output="vpath")
+}
+```
+We can print this output to see that we have information on the shortest number of steps to each observer
+iterating through each neighbor being the root.
+
+We also have WHO or what NODES were used to get there.
+
+Recall, the GMLA does not actually need that information. It just needs the length of the path
+PTVA (the previous algorithm before GMLA), did use that information.
+
+So let's run through getting the score for each neighbor in this first step.
+```{r}
+
+#neighbor 1 ID=19
+###################\
+distobs1<-vector()
+for(i in 1:length(subobs2$id)){
+distobs1[i]<-length(l[[1]][[i]])
+}
+distobs1
+
+#these are the distances to the other 4 observers
+
+#we also need the distance from the neighbor to the reference node
+length(unlist(reff[[1]]))
+
+#4 hops to the reference.
+mu1<-vector()
+#let's compute the mu vector
+for(i in 1:length(subobs2$id)){
+mu1[i]<-computemu(trumu,distobs1[i],length(unlist(reff[[1]])))
+}
+
+```
+We see here that neighbor 1 (node ID 19) has a mean delay time vector of [0 0 -2 0 0]. This results because
+the distance to the reference is = to most of the path lengths to the observers from neighbor ID 19.
+
+Let's repeat the process for the other neighbors!
+
+```{r}
+distobs2<-vector()
+distobs3<-vector()
+distobs4<-vector()
+distobs5<-vector()
+distobs6<-vector()
+distobs7<-vector()
+
+
+for(i in 1:length(subobs2$id)){
+distobs2[i]<-length(l[[2]][[i]])
+distobs3[i]<-length(l[[3]][[i]])
+distobs4[i]<-length(l[[4]][[i]])
+distobs5[i]<-length(l[[5]][[i]])
+distobs6[i]<-length(l[[6]][[i]])
+distobs7[i]<-length(l[[7]][[i]])
+}
+
+
+
+
+#these are the distances to the other 5 observers
+
+#we also need the distance from the neighbor to the reference node
+
+#4 hops to the reference.
+mu2<-vector()
+mu3<-vector()
+mu4<-vector()
+mu5<-vector()
+mu6<-vector()
+mu7<-vector()
+
+#let's compute the mu vector
+for(i in 1:length(subobs2$id)){
+mu2[i]<-computemu(trumu,distobs2[i],length(unlist(reff[[2]])))
+mu3[i]<-computemu(trumu,distobs3[i],length(unlist(reff[[3]])))
+mu4[i]<-computemu(trumu,distobs4[i],length(unlist(reff[[4]])))
+mu5[i]<-computemu(trumu,distobs5[i],length(unlist(reff[[5]])))
+mu6[i]<-computemu(trumu,distobs6[i],length(unlist(reff[[6]])))
+mu7[i]<-computemu(trumu,distobs7[i],length(unlist(reff[[7]])))
+}
+
+```
+The last thing we need is to compute Covariance matrix!
+Then use the observed delay differences for the k0.
+
+
+For the covariance matrix this will actually remain constant for all steps in the
+algorithm. This is because it involves only information about the reference observer
+and the other observers in the network.
+Recall the equation is:
+[Λs]k,i = σ2|P(o_K, o_k) ∩ P(o_K, o_i)|
+
+Where o_K is the reference obs. and o_k is observer k.
+o_i runs from i =1 ... K-1. 
+
+So our matrix should be (k-1) x (k-1). 
+Since we have 5 observers this leaves us with a 4 x 4 matrix.
+
+We will compute shortest path from reference to the other observers. Notice in
+the equation we need to look at the actual path between reference and observers
+Find the common edges (hence the intersection notation) and then obtain the magnitude of that path:
+i.e. get the length of the intersection of the paths.
+```{r}
+sigg<-shortest_paths(nett, from=V(nett)%in%ref$id,to=V(nett)%in%subobs2$id, output="epath")
+sigg
+```
+The printed output gives us the shortest paths from the reference node to the other observers. 
+
+Now we want the intersection of these paths and obtain the magnitude.
+
+```{r}
+#we know that the diagonals of the matrix are just the magnitudes of the paths outputted
+#above because the diagonals are for observer k with itself from the reference observer.
+for (i in 1:(k0-1)){
+lengths<-length(sigg[["epath"]][[i]])
+print(lengths)
+}
+
+#diagonal is 3,2,3,1.
+```
+Now for off diagonal we need the unique intersection of the paths.
+```{r}
+#we create some subgraphs based on the epath output
+g1 <- graph.formula(27-+77-+42-+51)
+g2 <- graph.formula(27-+26-+62)
+g3 <- graph.formula(27-+5-+49-+71)
+g4 <- graph.formula(27-+77)
+
+#now let's get the intersection for each 
+g5 <- graph.intersection(g1, g2, keep.all.vertices = FALSE)
+g5
+#0 edges in common
+
+g6 <- graph.intersection(g1, g3, keep.all.vertices = FALSE)
+g6
+#0 edges in common
+
+
+g7 <- graph.intersection(g1, g4, keep.all.vertices = FALSE)
+g7
+#1 edge in common
+
+g8 <- graph.intersection(g2, g3, keep.all.vertices = FALSE)
+g8
+#0 edges in common
+
+g9 <- graph.intersection(g2, g4, keep.all.vertices = FALSE)
+g9
+#0 edges in common
+
+g10 <- graph.intersection(g3, g4, keep.all.vertices = FALSE)
+g10
+#0 edges in common
+```
+Now we can form our covariance matrix using this. As can be seen, the motivation for finding the 
+intersection of these paths between observers gives us an idea if we have multicoll. present in our path
+creations. This is necessary when trying to find the source - as we want to factor in any variation that could occur 
+when tracking the possible BFS and delay times associated with the BFS. 
+
+```{r}
+caplam<-matrix(c(length(sigg[["epath"]][[1]]),0,0,1,
+                      0,length(sigg[["epath"]][[2]]), 0,0,
+                               0,0,length(sigg[["epath"]][[3]]),0,
+                                          1,0,0,length(sigg[["epath"]][[4]])), ncol=(k0-1),nrow=(k0-1),byrow=T )
+
+#Multiply the matrix by the "known" sig^2
+
+caplam<-sigma2*caplam
+```
+Now we are all set up to compute the scores of the neighbors FINALLY!
+
+```{r}
+score(mu1,caplam,subobs2$diffdelay)
+score(mu2,caplam,subobs2$diffdelay)
+score(mu3,caplam,subobs2$diffdelay)
+score(mu4,caplam,subobs2$diffdelay)
+score(mu5,caplam,subobs2$diffdelay)
+score(mu6,caplam,subobs2$diffdelay)
+score(mu7,caplam,subobs2$diffdelay)
+
+```
+We see an immediate problem here. In computing the score all scores go to infinity!
+This is because of the exponential term.
+
+So the algorithm breaks here. We have no way of knowing which neighbor to move to!
+
+So let's take the log of this MVN score function since the exponential term seems to break the score calculation.
+
+```{r}
+logscore<-function(muvec,covv,delayvec){
+  diff<-delayvec-muvec
+  numerator<-(-1/2)*t(diff)%*%solve(covv)%*%(diff)
+  denom<-sqrt(det(covv))
+  s<-((-1/2)*numerator)-log(denom)
+  print(s)
+}
+```
+Now recalculate.
+```{r}
+scores1<-c(logscore(mu1,caplam,subobs2$diffdelay),
+logscore(mu2,caplam,subobs2$diffdelay),
+logscore(mu3,caplam,subobs2$diffdelay),
+logscore(mu4,caplam,subobs2$diffdelay),
+logscore(mu5,caplam,subobs2$diffdelay),
+logscore(mu6,caplam,subobs2$diffdelay),
+logscore(mu7,caplam,subobs2$diffdelay))
+
+
+max(scores1)
+```
+This output shows that we should move to the 4th neighbor! So node 52.
+
+Now we repeat the process for node 52.
+
+```{r}
+scorematrix<-matrix(ncol=2)
+scorematrix<-as.matrix(cbind(neigh[4],scores1[4]))
+#store the score in score matrix
+
+neigh2<-neighbors(nett,V(nett)%in%neigh[4],mode="out")
+#6 neighbors: 19,23,30,45,62,70
+
+#now get shortest paths rooted at neighbors to each of the k0 observers
+numberofneighbors2<-length(neigh2)
+
+#store the shortest paths in a vector list
+l2<-vector(mode="list")
+reff2<-vector(mode="list") #shortest path to reference obs
+for(i in 1:numberofneighbors2){
+#p[i]<-get.all.shortest.paths(ptnGoe, neigh[i], to = as.character(subobs$node))
+l2[i]<-shortest_paths(nett, from=neigh2[i],to=V(nett)%in%subobs2$id, output="vpath")
+reff2[i]<-shortest_paths(nett, from=neigh2[i],to=V(nett)%in%ref$id, output="vpath")
+}
+```
+So, we have effectively repeated the same process as before.
+
+```{r}
+distobs1<-vector()
+distobs2<-vector()
+distobs3<-vector()
+distobs4<-vector()
+distobs5<-vector()
+distobs6<-vector()
+
+
+for(i in 1:length(subobs2$id)){
+distobs1[i]<-length(l2[[1]][[i]])
+distobs2[i]<-length(l2[[2]][[i]])
+distobs3[i]<-length(l2[[3]][[i]])
+distobs4[i]<-length(l2[[4]][[i]])
+distobs5[i]<-length(l2[[5]][[i]])
+distobs6[i]<-length(l2[[6]][[i]])
+}
+
+
+
+
+#these are the distances to the other 5 observers
+
+#we also need the distance from the neighbor to the reference node
+
+#4 hops to the reference.
+mu1<-vector()
+mu2<-vector()
+mu3<-vector()
+mu4<-vector()
+mu5<-vector()
+mu6<-vector()
+
+#let's compute the mu vector
+for(i in 1:length(subobs2$id)){
+mu1[i]<-computemu(trumu,distobs1[i],length(unlist(reff2[[1]])))
+mu2[i]<-computemu(trumu,distobs2[i],length(unlist(reff2[[2]])))
+mu3[i]<-computemu(trumu,distobs3[i],length(unlist(reff2[[3]])))
+mu4[i]<-computemu(trumu,distobs4[i],length(unlist(reff2[[4]])))
+mu5[i]<-computemu(trumu,distobs5[i],length(unlist(reff2[[5]])))
+mu6[i]<-computemu(trumu,distobs6[i],length(unlist(reff2[[6]])))
+}
+```
+We do not repeat calculating the Cov matrix because it uses the same intersection paths.
+
+Let's proceed by using the log score as before.
+
+```{r}
+scores2<-c(logscore(mu1,caplam,subobs2$diffdelay),
+logscore(mu2,caplam,subobs2$diffdelay),
+logscore(mu3,caplam,subobs2$diffdelay),
+logscore(mu4,caplam,subobs2$diffdelay),
+logscore(mu5,caplam,subobs2$diffdelay),
+logscore(mu6,caplam,subobs2$diffdelay))
+
+
+max(scores2)
+
+```
+Based on this we moe to the 6th neighbor of node 52.
+
+Let's store that node in the score matrix.
+
+```{r}
+scorematrix2<-cbind(neigh2[6],max(scores2))
+scorematrix<-rbind(scorematrix,scorematrix2)
+
+rm(scorematrix2)
+```
+
+Now we repeat the process for node 70.
+
+```{r}
+
+neigh3<-neighbors(nett,V(nett)%in%neigh2[6],mode="out")
+#6 neighbors: 19,23,30,45,62,70
+
+#now get shortest paths rooted at neighbors to each of the k0 observers
+numberofneighbors2<-length(neigh3)
+
+#store the shortest paths in a vector list
+l2<-vector(mode="list")
+reff2<-vector(mode="list") #shortest path to reference obs
+for(i in 1:numberofneighbors2){
+#p[i]<-get.all.shortest.paths(ptnGoe, neigh[i], to = as.character(subobs$node))
+l2[i]<-shortest_paths(nett, from=neigh3[i],to=V(nett)%in%subobs2$id, output="vpath")
+reff2[i]<-shortest_paths(nett, from=neigh3[i],to=V(nett)%in%ref$id, output="vpath")
+}
+```
+So, we have effectively repeated the same process as before.
+
+```{r}
+distobs1<-vector()
+distobs2<-vector()
+distobs3<-vector()
+
+
+
+for(i in 1:length(subobs2$id)){
+distobs1[i]<-length(l2[[1]][[i]])
+distobs2[i]<-length(l2[[2]][[i]])
+distobs3[i]<-length(l2[[3]][[i]])
+
+}
+
+
+
+
+#these are the distances to the other 5 observers
+
+#we also need the distance from the neighbor to the reference node
+
+#4 hops to the reference.
+mu1<-vector()
+mu2<-vector()
+mu3<-vector()
+
+
+#let's compute the mu vector
+for(i in 1:length(subobs2$id)){
+mu1[i]<-computemu(trumu,distobs1[i],length(unlist(reff2[[1]])))
+mu2[i]<-computemu(trumu,distobs2[i],length(unlist(reff2[[2]])))
+mu3[i]<-computemu(trumu,distobs3[i],length(unlist(reff2[[3]])))
+
+}
+```
+We do not repeat calculating the Cov matrix because it uses the same intersection paths.
+
+Let's proceed by using the log score as before.
+
+```{r}
+scores3<-c(logscore(mu1,caplam,subobs2$diffdelay),
+logscore(mu2,caplam,subobs2$diffdelay),
+logscore(mu3,caplam,subobs2$diffdelay)
+)
+
+
+max(scores3)
+
+scorematrix3<-cbind(neigh3[2],max(scores3))
+scorematrix<-rbind(scorematrix,scorematrix3)
+
+rm(scorematrix3)
+```
+Now we repeat the process for node 64.
+
+```{r}
+
+neigh4<-neighbors(nett,V(nett)%in%neigh3[2],mode="out")
+#6 neighbors: 19,23,30,45,62,70
+
+#now get shortest paths rooted at neighbors to each of the k0 observers
+numberofneighbors2<-length(neigh4)
+
+#store the shortest paths in a vector list
+l2<-vector(mode="list")
+reff2<-vector(mode="list") #shortest path to reference obs
+for(i in 1:numberofneighbors2){
+#p[i]<-get.all.shortest.paths(ptnGoe, neigh[i], to = as.character(subobs$node))
+l2[i]<-shortest_paths(nett, from=neigh4[i],to=V(nett)%in%subobs2$id, output="vpath")
+reff2[i]<-shortest_paths(nett, from=neigh4[i],to=V(nett)%in%ref$id, output="vpath")
+}
+```
+So, we have effectively repeated the same process as before.
+
+```{r}
+distobs1<-vector()
+distobs2<-vector()
+distobs3<-vector()
+distobs4<-vector()
+distobs5<-vector()
+distobs6<-vector()
+distobs7<-vector()
+distobs8<-vector()
+
+for(i in 1:length(subobs2$id)){
+distobs1[i]<-length(l2[[1]][[i]])
+distobs2[i]<-length(l2[[2]][[i]])
+distobs3[i]<-length(l2[[3]][[i]])
+distobs4[i]<-length(l2[[4]][[i]])
+distobs5[i]<-length(l2[[5]][[i]])
+distobs6[i]<-length(l2[[6]][[i]])
+distobs7[i]<-length(l2[[7]][[i]])
+distobs8[i]<-length(l2[[8]][[i]])
+}
+
+
+
+
+#these are the distances to the other 5 observers
+
+#we also need the distance from the neighbor to the reference node
+
+#4 hops to the reference.
+mu1<-vector()
+mu2<-vector()
+mu3<-vector()
+mu4<-vector()
+mu5<-vector()
+mu6<-vector()
+mu7<-vector()
+mu8<-vector()
+
+#let's compute the mu vector
+for(i in 1:length(subobs2$id)){
+mu1[i]<-computemu(trumu,distobs1[i],length(unlist(reff2[[1]])))
+mu2[i]<-computemu(trumu,distobs2[i],length(unlist(reff2[[2]])))
+mu3[i]<-computemu(trumu,distobs3[i],length(unlist(reff2[[3]])))
+mu4[i]<-computemu(trumu,distobs4[i],length(unlist(reff2[[4]])))
+mu5[i]<-computemu(trumu,distobs5[i],length(unlist(reff2[[5]])))
+mu6[i]<-computemu(trumu,distobs6[i],length(unlist(reff2[[6]])))
+mu7[i]<-computemu(trumu,distobs7[i],length(unlist(reff2[[7]])))
+mu8[i]<-computemu(trumu,distobs8[i],length(unlist(reff2[[8]])))
+}
+```
+We do not repeat calculating the Cov matrix because it uses the same intersection paths.
+
+Let's proceed by using the log score as before.
+
+```{r}
+scores4<-c(logscore(mu1,caplam,subobs2$diffdelay),
+logscore(mu2,caplam,subobs2$diffdelay),
+logscore(mu3,caplam,subobs2$diffdelay),
+logscore(mu4,caplam,subobs2$diffdelay),
+logscore(mu5,caplam,subobs2$diffdelay),
+logscore(mu6,caplam,subobs2$diffdelay),
+logscore(mu7,caplam,subobs2$diffdelay),
+logscore(mu8,caplam,subobs2$diffdelay)
+)
+
+
+max(scores4)
+
+
+```
+Interesting! We have our first tie!
+Neighbors 3 and 5 have the same max score!
+
+```{r}
+neigh4[3]
+neigh4[5]
+
+degree(nett,V(nett)%in%neigh4[3],mode="out")
+degree(nett,V(nett)%in%neigh4[5], mode="out")
+```
+Because of the tie that resulted, we look at the out-degree of the nodes (i.e. how many other people could they have possibly infected)
+
+This points to us using Neighbor 5 - Node 63.
+```{r}
+scorematrix4<-cbind(neigh4[5],max(scores4))
+scorematrix<-rbind(scorematrix,scorematrix4)
+
+rm(scorematrix4)
+
+```
+
+Repeat for node 63.
+```{r}
+
+neigh5<-neighbors(nett,V(nett)%in%neigh4[5],mode="out")
+#6 neighbors: 19,23,30,45,62,70
+
+#now get shortest paths rooted at neighbors to each of the k0 observers
+numberofneighbors2<-length(neigh5)
+
+#store the shortest paths in a vector list
+l2<-vector(mode="list")
+reff2<-vector(mode="list") #shortest path to reference obs
+for(i in 1:numberofneighbors2){
+#p[i]<-get.all.shortest.paths(ptnGoe, neigh[i], to = as.character(subobs$node))
+l2[i]<-shortest_paths(nett, from=neigh5[i],to=V(nett)%in%subobs2$id, output="vpath")
+reff2[i]<-shortest_paths(nett, from=neigh5[i],to=V(nett)%in%ref$id, output="vpath")
+}
+```
+So, we have effectively repeated the same process as before.
+
+```{r}
+distobs1<-vector()
+distobs2<-vector()
+distobs3<-vector()
+distobs4<-vector()
+distobs5<-vector()
+
+
+for(i in 1:length(subobs2$id)){
+distobs1[i]<-length(l2[[1]][[i]])
+distobs2[i]<-length(l2[[2]][[i]])
+distobs3[i]<-length(l2[[3]][[i]])
+distobs4[i]<-length(l2[[4]][[i]])
+distobs5[i]<-length(l2[[5]][[i]])
+
+}
+
+
+
+
+#these are the distances to the other 5 observers
+
+#we also need the distance from the neighbor to the reference node
+
+#4 hops to the reference.
+mu1<-vector()
+mu2<-vector()
+mu3<-vector()
+mu4<-vector()
+mu5<-vector()
+
+
+#let's compute the mu vector
+for(i in 1:length(subobs2$id)){
+mu1[i]<-computemu(trumu,distobs1[i],length(unlist(reff2[[1]])))
+mu2[i]<-computemu(trumu,distobs2[i],length(unlist(reff2[[2]])))
+mu3[i]<-computemu(trumu,distobs3[i],length(unlist(reff2[[3]])))
+mu4[i]<-computemu(trumu,distobs4[i],length(unlist(reff2[[4]])))
+mu5[i]<-computemu(trumu,distobs5[i],length(unlist(reff2[[5]])))
+
+}
+```
+We do not repeat calculating the Cov matrix because it uses the same intersection paths.
+
+Let's proceed by using the log score as before.
+
+```{r}
+scores5<-c(logscore(mu1,caplam,subobs2$diffdelay),
+logscore(mu2,caplam,subobs2$diffdelay),
+logscore(mu3,caplam,subobs2$diffdelay),
+logscore(mu4,caplam,subobs2$diffdelay),
+logscore(mu5,caplam,subobs2$diffdelay)
+)
+
+
+max(scores5)
+
+
+```
+Neighbor 4 - NODE 64.
+```{r}
+scorematrix5<-cbind(neigh5[4],max(scores5))
+scorematrix<-rbind(scorematrix,scorematrix5)
+
+rm(scorematrix5)
+
+```
+
+Repeat for node 63.
+```{r}
+
+neigh6<-neighbors(nett,V(nett)%in%neigh5[4],mode="out")
+#6 neighbors: 19,23,30,45,62,70
+
+#now get shortest paths rooted at neighbors to each of the k0 observers
+numberofneighbors2<-length(neigh6)
+
+#store the shortest paths in a vector list
+l2<-vector(mode="list")
+reff2<-vector(mode="list") #shortest path to reference obs
+for(i in 1:numberofneighbors2){
+#p[i]<-get.all.shortest.paths(ptnGoe, neigh[i], to = as.character(subobs$node))
+l2[i]<-shortest_paths(nett, from=neigh6[i],to=V(nett)%in%subobs2$id, output="vpath")
+reff2[i]<-shortest_paths(nett, from=neigh6[i],to=V(nett)%in%ref$id, output="vpath")
+}
+```
+So, we have effectively repeated the same process as before.
+
+```{r}
+distobs1<-vector()
+distobs2<-vector()
+distobs3<-vector()
+distobs4<-vector()
+distobs5<-vector()
+distobs6<-vector()
+distobs7<-vector()
+distobs8<-vector()
+
+for(i in 1:length(subobs2$id)){
+distobs1[i]<-length(l2[[1]][[i]])
+distobs2[i]<-length(l2[[2]][[i]])
+distobs3[i]<-length(l2[[3]][[i]])
+distobs4[i]<-length(l2[[4]][[i]])
+distobs5[i]<-length(l2[[5]][[i]])
+distobs6[i]<-length(l2[[6]][[i]])
+distobs7[i]<-length(l2[[7]][[i]])
+distobs8[i]<-length(l2[[8]][[i]])
+}
+
+
+
+
+#these are the distances to the other 5 observers
+
+#we also need the distance from the neighbor to the reference node
+
+#4 hops to the reference.
+mu1<-vector()
+mu2<-vector()
+mu3<-vector()
+mu4<-vector()
+mu5<-vector()
+mu6<-vector()
+mu7<-vector()
+mu8<-vector()
+
+#let's compute the mu vector
+for(i in 1:length(subobs2$id)){
+mu1[i]<-computemu(trumu,distobs1[i],length(unlist(reff2[[1]])))
+mu2[i]<-computemu(trumu,distobs2[i],length(unlist(reff2[[2]])))
+mu3[i]<-computemu(trumu,distobs3[i],length(unlist(reff2[[3]])))
+mu4[i]<-computemu(trumu,distobs4[i],length(unlist(reff2[[4]])))
+mu5[i]<-computemu(trumu,distobs5[i],length(unlist(reff2[[5]])))
+mu6[i]<-computemu(trumu,distobs6[i],length(unlist(reff2[[6]])))
+mu7[i]<-computemu(trumu,distobs7[i],length(unlist(reff2[[7]])))
+mu8[i]<-computemu(trumu,distobs8[i],length(unlist(reff2[[8]])))
+}
+```
+We do not repeat calculating the Cov matrix because it uses the same intersection paths.
+
+Let's proceed by using the log score as before.
+
+```{r}
+scores6<-c(logscore(mu1,caplam,subobs2$diffdelay),
+logscore(mu2,caplam,subobs2$diffdelay),
+logscore(mu3,caplam,subobs2$diffdelay),
+logscore(mu4,caplam,subobs2$diffdelay),
+logscore(mu5,caplam,subobs2$diffdelay),
+logscore(mu6,caplam,subobs2$diffdelay),
+logscore(mu7,caplam,subobs2$diffdelay),
+logscore(mu8,caplam,subobs2$diffdelay)
+)
+
+
+max(scores6)
+neigh6
+```
+We have another tie!
+Between nodes 34 and 63.
+Node 63 has been selected before and 
+If we examine the score matrix we see that we are caught in a loop of picking the 
+same nodes and they have the same score = 28427.14.
+
+However, further inspection of the neighbors we have ended up with we see that the true
+source has been listed as a neighbor of some of these nodes, but was not moved to as having the highest score.
+Nodes 63 and 64 are close to 69, but not the true source.
+
+```{r}
+neigh
+neigh2
+neigh3
+neigh4
+neigh5
+neigh6
+
+```
+We see that in the first iteration we had the option to hit the true source, but did not!
+Then we returned to possibly hitting the true source - node 69, in step 4, but didn't again.
+
+
+

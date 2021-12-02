@@ -1,0 +1,294 @@
+---
+title: "GMLA"
+author: "Matthew Shisler, Kate Sanborn, Richard Watson"
+date: "11/25/2021"
+output: word_document
+---
+
+In conjunction with the tutorial version, we created this more automated way of 
+running through the Gradient Maximum Likelihood Algorithm.
+
+The end result is a graph with pasted scores, the true source, the estimated source, 
+and the distance between the true source and estimated source.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(igraph)
+library(tidygraph)
+library(ggraph)
+library(netdiffuseR)
+library(EpiModel)
+library(tidyverse)
+library(shp2graph)
+```
+This utilizes the Duke propagation tutorial code referenced in the GMLA tutorial.
+```{r}
+n.people <- 100
+p.infection <- 0.5
+contact.rate <- 0.05  # prob. of contact between any 2 people in the network
+
+set.seed(919)
+
+# generate the network
+net <- play_erdos_renyi(n.people,contact.rate, directed = F)
+ggraph(net, layout = "kk") +
+  geom_edge_link() +
+  geom_node_point(size = 6)
+
+# choose ONE infected person
+infected <- rep(FALSE, n.people)
+infected[sample(1:n.people,1)] <- TRUE
+
+# extract the edge list for the sim
+el <- net %>% activate(edges) %>% as.data.frame()
+
+# pre-allocate a list of the sim. Each element is a logical
+# vector for nodes being infected. The list is indexed by time.
+# right now the max is set to 1000. The list will grow on its
+# own if full infection takes longer.
+infections <- vector(length = 1000, mode = "list")
+infections[[1]] <- infected
+
+# loop infection steps until EVERYONE is infected
+# (rather than loop for a pre-sprecified time)
+t=2
+while (sum(!infections[[t-1]])>0) {
+  infections[[t]] <- infections[[t - 1]]
+  
+  # Pick an edge at random
+  random.edge <- sample(nrow(el), size = 1)
+  
+  # If the edge is discordant, flip a coin to decide if the infection spreads
+  if (with(el[random.edge, ], 
+           infections[[t]][from] != infections[[t]][to])) {
+    
+    who.susceptible <- with(
+      el[random.edge, ],
+      c(from, to)[!c(infections[[t]][from], infections[[t]][to])]
+      )
+    
+    infections[[t]][who.susceptible] <- sample(
+      c(T, F), 
+      size = 1, 
+      prob = c(p.infection, 1 - p.infection)
+    )
+  }
+  t=t+1
+}
+
+# Record the time it took for everyone to become infected
+max.time=t-1
+
+# trim the infections list of any extra empy list elements
+# (because we pre-allocated too many)
+infections <- infections[lapply(infections,length)>0]
+
+# transform the infections list into a dataframe which
+# stores the nodes ids and the time that they were infected
+# with respect to the BEGINNING of the simulation.
+results <- infections %>%
+  lapply(FUN = as.data.frame) %>%
+  lapply(FUN = magrittr::set_names, value = "infected") %>%
+  bind_rows(.id = "t") %>%
+  mutate(id = rep(1:n.people, times = max.time),
+         t = as.integer(t)) %>%
+  tbl_df %>%   group_by(id) %>%
+  summarize(time.infected = min(t[infected]))
+
+# Add the infections times and the source identifier to
+# the network object
+net <- net %>%
+  activate(nodes) %>%
+  mutate(node_id = 1:n.people) %>%
+  mutate(true_infection_time = results$time.infected) %>%
+  mutate(source = infected)
+
+# graph the network with a filter on infection time.
+# it'd be kind of neat if we could animate this. . .
+ggraph(net, layout = "kk") +
+  geom_edge_link() +
+  geom_node_point(aes(color=true_infection_time<100), size = 6)
+
+```
+Next task is to try to convert Kate's code so far into something that works with the tidygraph structure.
+Hopefully this will be in general easier to operate on.
+```{r}
+# identify proportion of nodes to be observers
+prop_observers <- 0.2
+observers_index <- sample(1:n.people, 
+                          ceiling(n.people*prop_observers), 
+                          replace=F)
+
+# create new columns identifying observers and the relative infection time among observers.
+net <- net %>%
+  activate(nodes) %>%
+  mutate(observer = ifelse(node_id %in% observers_index,T,F)) %>%
+  mutate(observed_infection_time = ifelse(observer==T, 
+                                          true_infection_time, 
+                                          NA)) %>%
+  mutate(observed_infection_time = observed_infection_time - min(observed_infection_time, 
+                                                                 na.rm = T)) %>%
+  arrange(desc(observer),true_infection_time)
+
+# current structure of nodes
+net %>%
+  as.data.frame()
+```
+```{r}
+# mean propagation time per edge, mu
+# variance of propagation time per edge, sigma^2
+# propagation ratio, lambda
+mu = 1/p.infection
+sigma2 <- (1-p.infection)/p.infection^2 
+lambda <- mu/sqrt(sigma2)
+
+
+# how many observers do we care about?
+k0 <- 10
+top_observers <- net %>% 
+  filter(observer==T) %>% 
+  pull(node_id) %>%
+  head(n=k0)
+
+d_vec <- net %>% 
+  filter(observer==T) %>% 
+  pull(observed_infection_time) %>%
+  head(n=k0) %>% tail(n=-1)
+
+# set the reference observer, o_K
+# and other top observers, o_k (k=1,...,K-1)
+reference_observer <- top_observers[1]
+other_observers    <- top_observers[-1]
+
+# we need to create the covariance matrix Lambda
+# first, compute the shortest paths from the reference observer to the other top observers
+lam1 <- shortest_paths(net, reference_observer, other_observers, output = "epath")$epath
+
+# next, the diagonal of the matrix will be the size of each path multiplied by sigma^2
+# this is because the intersection between a set and itself is the original set.
+Lambda_mat <- diag(sigma2*as.integer(lapply(lam1, length)))
+
+
+# we should only need to compute the upper triangle, right?
+for (i in 1:(length(other_observers)-1)){
+  for (j in (1+i):length(other_observers)){
+    Lambda_mat[i,j] <- sigma2*length(intersection(lam1[[i]], lam1[[j]]))
+  }
+}
+
+# make it symmetric and then take the inverse
+Lambda_mat <- Lambda_mat*upper.tri(Lambda_mat, diag = F) + t(Lambda_mat)
+inv_Lambda_mat <- solve(Lambda_mat)
+```
+
+
+
+
+
+
+```{r}
+# now for the loop
+v<-vector()
+v[1] <- reference_observer
+score_max <- 0
+S_nodes  <- c() 
+S_scores <- c()
+
+# get the initial v node neighbors
+neighbors <- as.integer(neighbors(net, v[1]))
+
+
+k=1
+while (!is_empty(neighbors)){
+  # initialize neighbor scores
+  neighbor_scores <- rep(0,length(neighbors))
+  
+  # compute the score for each neighbor
+  for (i in  1:length(neighbors)){
+    # get the shortest path from neighbor i to reference observers
+    # short_path_to_ref <- shortest_paths(net, node, reference_observer, output = "epath")
+    # short_paths_to_others <- shortest_paths(net, node, other_observers, output = "both")
+    
+    # we only need distances to compute mu, this function might be faster
+    dist_to_ref <- as.integer(distances(net, neighbors[i], reference_observer))
+    dist_to_others <- as.integer(distances(net, neighbors[i], other_observers))
+    
+    mu_vec <- mu*(dist_to_others-dist_to_ref)
+    # do we really need to compute the denominator of the score?
+    #score <- exp(-0.5*(d_vec-mu_vec)%*%inv_Lambda_mat%*%(d_vec-mu_vec))
+    neighbor_scores[i] <- (-0.5*(d_vec-mu_vec)%*%inv_Lambda_mat%*%(d_vec-mu_vec)) - log(sqrt(det(Lambda_mat)))
+    # get shortest paths from neighbor i to other observers
+  }
+
+  
+  # determine the next v, store the nodes and scores, construct the next
+  # neighborhood remembering to not consider nodes we already have a score for.
+  # if this neighborhood is empty, then we can stop because all the surrounding
+  # nodes have a smaller score.
+  v[k+1] <- neighbors[which(neighbor_scores==max(neighbor_scores))]
+  
+  # don't really need the max score any more. The stopping condition is
+  # if the next set of neighbors is empty.
+  score_max <- max(neighbor_scores)
+  
+  # add nodes and score to running list.
+  S_nodes <- c(S_nodes, neighbors)
+  S_scores <- c(S_scores, neighbor_scores)
+  
+  # get the next set of neighbors less the nodes that already have scores
+  neighbors <- setdiff(as.integer(neighbors(net, v[k+1])), S_nodes)
+  k = k+1
+}
+
+# add scores to the network object
+net <- net %>% 
+  activate(nodes) %>%
+  left_join(tibble(node_id = S_nodes, score = S_scores), by="node_id")
+
+net %>%
+  as.data.frame()
+
+```
+
+```{r}
+# the node with the maximum number is the estimated source.
+# in 
+# graph isn't really helpful. . .messy
+ggraph(net, layout = "kk") +
+  geom_edge_link() +
+  geom_node_point(aes(colour=true_infection_time<16, shape=observer),  size = 6) +
+  geom_node_text(aes(label=node_id))+
+  geom_node_label(aes(label=score), nudge_y = 0.3)
+
+# the path of the estimator (in the direction of the gradient)
+# is in v.
+v
+
+# The true source and estimated source
+which(infected)
+v[length(v)]
+
+
+# distance from true source to estimated source.
+distances(net,which(infected),v[length(v)])
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

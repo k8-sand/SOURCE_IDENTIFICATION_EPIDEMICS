@@ -1,0 +1,555 @@
+---
+title: "Untitled"
+author: "Matthew Shisler"
+date: "12/1/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(igraph)
+library(tidygraph)
+library(ggraph)
+library(EpiModel)
+library(tidyverse)
+library(shp2graph)
+library(scales)
+```
+The re-factored code from Duke. The issue we want to explore is in the loop that propagate the virus. This first chunk is set-up.
+```{r}
+n.people <- 121
+p.infection <- 0.5
+contact.rate <- 0.05  # prob. of contact between any 2 people in the network
+
+set.seed(919)
+
+# generate the network
+net_er <- play_erdos_renyi(n.people,contact.rate, directed = F)
+n_level <- 5   # number of levels in the tree
+d       <- 3   # degree of each node in the tree (other than root)
+
+n_nodes <- (d^n_level-1)/(d-1)  # the number of nodes for a "full" tree.
+
+# will use tidygraph as the API for igraph.
+net_tree <- create_tree(n_nodes, d, directed = F)
+
+
+ggraph(net_er, layout = "kk") +
+  geom_edge_link() +
+  geom_node_point(size = 6)
+
+# choose ONE infected person
+infected <- rep(FALSE, n.people)
+infected[sample(1:n.people,1)] <- TRUE
+source_id <- which(infected==T)
+
+
+# # extract the edge list for the sim
+# el <- net %>% activate(edges) %>% as.data.frame()
+# 
+# # pre-allocate a list of the sim. Each element is a logical
+# # vector for nodes being infected. The list is indexed by time.
+# # right now the max is set to 1000. The list will grow on its
+# # own if full infection takes longer.
+# infections <- vector(length = 1000, mode = "list")
+# infections[[1]] <- infected
+```
+
+
+This next chunk is the actual simulation. Let's describe the actions taken in a single time step. First, a random edge is drawn from the list of edges. If the edge is discordant (i.e. connecting an infected and non-infected node), then a coin is flipped to determine if the infection will propagate to the non-infected individual. If the randomly infected edge is not discordant, then we take another time step. This results in long propagation times since the action of the propagation along an edge is conditional on whether the edge was selected in the first place.
+
+We believe that the proper actions to take in a single time step would be to flip a coin for EVERY discordant edge. This way the infection would propagate at a much more reasonable rate.
+
+```{r}
+# build graph with variables for infected nodes and discordant edges
+net_sim <- net_tree %>%
+  activate(nodes) %>%
+  mutate(node_id = 1:n.people) %>%
+  mutate(infected=infected) %>%
+  mutate(time_infected = ifelse(infected,0,NA)) %>%
+  activate(edges) %>%
+  mutate(from_infected = infected[from]) %>%
+  mutate(to_infected = infected[to]) %>%
+  mutate(discordant = from_infected != to_infected)
+
+# inspect the node and edge dataframes if desired
+net_sim %>% activate(nodes) %>% as_tibble()
+net_sim %>% activate(edges) %>% as_tibble()
+
+# initialize stopping condition (all nodes infected)
+infect_check <- net_sim %>% 
+    activate(nodes) %>%
+    pull(infected)
+
+# initialize time step and max time steps
+time_limit <- 200
+time_step = 1
+
+# propagate infection until all are infected or we reach the time limit
+while(any(!infect_check) && time_step < time_limit){  
+  
+  # identify susceptible nodes
+  sus_nodes <- net_sim %>% activate(edges) %>%
+    filter(discordant) %>%
+    mutate(susceptible = from*to_infected+to*from_infected) %>%
+    pull(susceptible)
+    
+  # flip coin for all susceptible nodes
+  # nodes which are susceptible to infection from more than one neighbor get separate coin flips
+  # for each neighbor
+  new_infected <- sus_nodes[sample(c(T,F), length(sus_nodes), replace = T, prob=c(p.infection,1-p.infection))]
+  
+  # update graph object with newly infected individuals
+  net_sim <- net_sim %>% 
+    activate(nodes) %>%
+    mutate(infected = ifelse(node_id %in% new_infected,TRUE,infected)) %>%
+    mutate(time_infected = ifelse(node_id %in% new_infected,time_step,time_infected)) %>%
+    activate(edges) %>%
+    mutate(from_infected = .N()$infected[from]) %>%
+    mutate(to_infected = .N()$infected[to]) %>%
+    mutate(discordant = from_infected != to_infected)
+  
+  # update stopping criteria and time step
+  infect_check <- net_sim %>% 
+    activate(nodes) %>%
+    pull(infected)
+  time_step = time_step + 1
+}
+
+# inspect result graph nodes and edges
+net_sim %>% activate(nodes) %>% as_tibble()
+net_sim %>% activate(edges) %>% as_tibble()
+```
+
+Graphing
+```{r}
+max_time <- max(net_sim %>% activate(nodes) %>% pull(time_infected))
+
+# step through time
+for (i in seq(from=1, max_time, length.out=15)){
+gr <- ggraph(net_sim, layout = "kk") +
+  geom_edge_link() +
+  geom_node_point(aes(color=time_infected<i), size = 6) +
+  theme_void()
+print(gr)
+}
+
+# use color gradient for single graph
+ggraph(net_sim, layout = "kk") +
+  geom_edge_link() +
+  geom_node_point(aes(color=time_infected), size = 6) +
+  scale_color_gradient(low = "red", high = "yellow", na.value = NA) +
+  labs(color="Time to infection") +
+  theme_void()
+
+```
+
+Continuous time step approach. Much more simple. . .
+```{r}
+net_det <- net_tree %>%
+  activate(nodes) %>%
+  mutate(node_id = 1:n.people) %>%
+  mutate(infected=infected) %>%
+  activate(edges) %>%
+  mutate(transmission_time = rexp(nrow(.E()))) %>%
+  activate(nodes) %>%
+  mutate(time_infected = as.numeric(distances(.,v=source_id, to=V(.), weights = E(.)$transmission_time))) %>%
+  mutate(bfs_prop_time = as.numeric(distances(.,v=source_id, to=V(.), weights = NA)))
+
+net_det %>% activate(nodes) %>% as_tibble()
+net_det %>% activate(edges) %>% as_tibble()
+
+# time step through infection
+max_time <- max(net_det %>% activate(nodes) %>% pull(time_infected))
+for (i in seq(from=1, max_time, length.out=15)){
+gr <- ggraph(net_det, layout = "kk") +
+  geom_edge_link() +
+  geom_node_point(aes(color=time_infected<i), size = 6) +
+  theme_void()
+print(gr)
+}
+
+# compare discrete to continuous infection simulation
+ggraph(net_sim, layout = "kk") +
+  geom_edge_link() +
+  geom_node_point(aes(color=rescale(time_infected)), size = 6) +
+  scale_color_gradient(low = "red", high = "yellow", na.value = NA) +
+  labs(color="Time to infection") +
+  theme_void()
+
+ggraph(net_det, layout = "kk") +
+  geom_edge_link() +
+  geom_node_point(aes(color=rescale(time_infected)), size = 6) +
+  scale_color_gradient(low = "red", high = "yellow", na.value = NA) +
+  labs(color="Time to infection") +
+  theme_void()
+```
+
+```{r}
+
+net_sim <- net_sim %>%
+  activate(nodes) %>%
+  mutate(scaled_time_infected = rescale(time_infected))
+
+net_det <- net_det %>%
+  activate(nodes) %>%
+  mutate(scaled_time_infected = rescale(time_infected)) %>%
+  mutate(scaled_bfs_prop_time = rescale(bfs_prop_time))
+
+ggraph(net_sim, layout = "kk") +
+  geom_edge_link() +
+  geom_node_point(aes(color=scaled_time_infected), size = 6) +
+  scale_color_gradient(low = "red", high = "yellow", na.value = NA) +
+  labs(color="Time to infection") +
+  theme_void()
+
+ggraph(net_det, layout = "kk") +
+  geom_edge_link() +
+  geom_node_point(aes(color=scaled_time_infected), size = 6) +
+  scale_color_gradient(low = "red", high = "yellow", na.value = NA) +
+  labs(color="Time to infection") +
+  theme_void()
+
+ggraph(net_det, layout = "kk") +
+  geom_edge_link() +
+  geom_node_point(aes(color=scaled_bfs_prop_time), size = 6) +
+  scale_color_gradient(low = "red", high = "yellow", na.value = NA) +
+  labs(color="Time to infection") +
+  theme_void()
+
+```
+
+
+```{r}
+set.seed(2021)
+demo_er <- play_erdos_renyi(20, 0.15, directed = F) %>%
+  mutate(node_id = 1:20)
+
+ggraph(demo_er, layout = "kk") +
+  geom_edge_link() +
+  geom_node_point(size = 8, color="cyan3") +
+  geom_node_text(aes(label=node_id)) +
+  theme_void()
+
+# the shortest path from 1 to 14 requires 3 hops
+shortest_paths(demo_er,1,6)
+
+# histogram of path lengths for all simple paths from node 1 to 14.
+histogram(sapply(all_simple_paths(demo_er, 1, 6),length)-1, type="count",
+          xlab="Lengths (hops) of Simple Paths from Node 1 to Node 6")
+
+path_data <- as.data.frame(table(sapply(all_simple_paths(demo_er, 1, 6),length)-1))
+
+path_data$Var1 <- as.numeric(levels(path_data$Var1))
+
+sampled_transmission_times <- data.frame(length=rep(path_data[,1],times=path_data[,2]), time=0)
+path_length_of_shortest_time <- rep(0,1000)
+transmission_time <- rep(0,1000)
+
+for (j in 1:1000){
+  for (i in 1:nrow(sampled_transmission_times)){
+    sampled_transmission_times[i,2] <- rgamma(1,sampled_transmission_times[i,1])
+  }
+  path_length_of_shortest_time[j] <- sampled_transmission_times[which(sampled_transmission_times[,2] == min(sampled_transmission_times[,2])),1]
+  transmission_time[j] <- min(sampled_transmission_times[,2])
+}
+  
+histogram(path_length_of_shortest_time,
+          breaks=seq(3,12,1),
+          xlab = "Path length (hops) of minimum infection time")
+histogram(transmission_time,
+          xlab="Node 6 infection time")
+
+
+```
+Whole infection simulation
+```{r}
+
+sim_bfs_path_diff <- vector(mode="list", length=1000)
+
+for (i in 1:1000){
+# generate a random ER graph with 100 nodes and contact rate = 0.05
+  net_er <- play_erdos_renyi(100,0.1, directed = F)
+  
+  # choose a random initial infected node
+  infected <- rep(FALSE, 100)
+  infected[sample(1:100,1)] <- TRUE
+  source_id <- which(infected==T)
+  
+  # simulate the edgewise infection times and shortest weighted paths for 
+  # nodewise infection times.
+  net_det <- net_er %>%
+    activate(nodes) %>%
+    mutate(node_id = 1:100) %>%
+    mutate(infected=infected) %>%
+    activate(edges) %>%
+    mutate(transmission_time = rexp(nrow(.E()))) %>%
+    activate(nodes) %>%
+    mutate(time_infected = as.numeric(distances(.,v=source_id, to=V(.), weights = E(.)$transmission_time))) %>%
+    mutate(bfs_prop_time = as.numeric(distances(.,v=source_id, to=V(.), weights = NA)))
+  
+  # compute the number of hops in the BFS paths and the paths resulting from the simulation.
+  bfs_path_lengths<- sapply(shortest_paths(net_det, from=source_id,to=V(net_det), weights = NA, output = "epath")$epath, length)
+  sim_path_lengths<- sapply(shortest_paths(net_det, from=source_id,to=V(net_det), weights = E(net_det)$transmission_time, output = "epath")$epath, length)
+  
+  # histogram(bfs_path_lengths,
+  #           breaks = seq(0,max(sim_path_lengths),1),
+  #           ylim=c(0,50))
+  # histogram(sim_path_lengths,
+  #           breaks = seq(0,max(sim_path_lengths),1),
+  #           ylim=c(0,50))
+  # histogram(sim_path_lengths-bfs_path_lengths,
+  #           breaks=seq(0,7,1))
+  
+  sim_bfs_path_diff[[i]] <- unclass(table(sim_path_lengths-bfs_path_lengths))
+  
+}  
+
+
+results <- plyr::ldply(sim_bfs_path_diff,rbind)
+
+
+
+histogram(colSums(results, na.rm = T))
+
+ggplot(colSums(results, na.rm = T)) + geom_bar(aes(x=1:12,y=))
+
+data <- data.frame(x=0:13, counts=colSums(results, na.rm = T))
+data[1,2] <- data[1,2]-1000
+
+ggplot(data) + geom_bar(aes(x=x,y=counts), stat="identity") +
+  xlab("Difference in BFS path hops and actual path hops in 1000 SI sims") +
+  theme_bw() + theme(text = element_text(size = 15)) 
+
+max(results[,9], na.rm = T)
+
+
+
+
+
+```
+
+Distribution of infection time
+```{r}
+net_er <- play_erdos_renyi(100,0.05, directed = F)
+
+  infected <- rep(FALSE, 100)
+  infected[sample(1:100,1)] <- TRUE
+  source_id <- which(infected==T)
+
+infection_times <- vector(mode="list", length=1000)
+
+for (i in 1:1000){
+  
+  # simulate the edgewise infection times and shortest weighted paths for 
+  # nodewise infection times.
+  time_infected <- net_er %>%
+    activate(nodes) %>%
+    mutate(node_id = 1:100) %>%
+    mutate(infected=infected) %>%
+    activate(edges) %>%
+    mutate(transmission_time = rexp(nrow(.E()))) %>%
+    activate(nodes) %>%
+    mutate(time_infected = as.numeric(distances(.,v=source_id, to=V(.), weights = E(.)$transmission_time))) %>%
+    pull(time_infected)
+
+infection_times[[i]] <- time_infected
+}
+  
+results <- plyr::ldply(infection_times,rbind)
+results <- results %>% gather()
+```
+Histograms of for simulated infection time distributions of each node.
+```{r}
+ggplot(results[1:12000,], aes(value)) +
+  geom_histogram() +
+  facet_wrap(~key, scales='free')
+
+ggplot(results[12001:24000,], aes(value)) +
+  geom_histogram() +
+  facet_wrap(~key, scales='free')
+
+ggplot(results[24001:36000,], aes(value)) +
+  geom_histogram() +
+  facet_wrap(~key, scales='free')
+
+ggplot(results[36001:48000,], aes(value)) +
+  geom_histogram() +
+  facet_wrap(~key, scales='free')
+
+ggplot(results[48001:60000,], aes(value)) +
+  geom_histogram() +
+  facet_wrap(~key, scales='free')
+
+ggplot(results[60001:72000,], aes(value)) +
+  geom_histogram() +
+  facet_wrap(~key, scales='free')
+
+ggplot(results[72001:84000,], aes(value)) +
+  geom_histogram() +
+  facet_wrap(~key, scales='free')
+
+ggplot(results[84001:96000,], aes(value)) +
+  geom_histogram() +
+  facet_wrap(~key, scales='free')
+
+ggplot(results[96001:100000,], aes(value)) +
+  geom_histogram() +
+  facet_wrap(~key, scales='free')
+```
+Many of these histograms look normal at first glance. The ones that are more highly skewed are closer to the source node. 
+```{r}
+# looking at larger and larger neighborhoods
+ego(net_er, order=1, nodes=source_id)
+ego(net_er, order=2, nodes=source_id)
+ego(net_er, order=5, nodes=source_id)
+ego(net_er, order=3, nodes=source_id)
+ego(net_er, order=4, nodes=source_id)
+ego(net_er, order=5, nodes=source_id)
+
+```
+
+As k increases, the gamma distribution approaches the normal distribution.
+```{r}
+
+k = 25
+
+x1 <- seq(0,50, length.out=1000)
+y11 <- dgamma(x1, k, rate=1)
+y12 <- dnorm(x1, k,sqrt(k))
+
+plot(x1, y11, type="l")
+lines(x1, y12, col=2)
+```
+
+Writing the discrete sim as a function - easily handles multiple sources, no delay times for edges must be calculated from output. Scaled on arbitrary time steps.
+```{r}
+
+sim_SI_discrete <- function(net,source_id,infection_prob=0.5,time_limit=200){
+  # initialize
+  net_sim <- net %>%
+    activate(nodes) %>%
+    mutate(node_id = 1:(nrow(.N()))) %>%
+    mutate(infected=FALSE) %>%
+    mutate(infected=ifelse(node_id %in% source_id,TRUE,infected)) %>%
+    mutate(time_infected = ifelse(infected,0,NA)) %>%
+    activate(edges) %>%
+    mutate(from_infected = .N()$infected[from]) %>%
+    mutate(to_infected = .N()$infected[to]) %>%
+    mutate(discordant = from_infected != to_infected)
+  
+  # initialize stopping condition (all nodes infected)
+  infect_check <- net_sim %>% 
+      activate(nodes) %>%
+      pull(infected)
+  
+  # initialize time step
+  time_step = 1
+  # propagate infection until all are infected or we reach the time limit
+  while(any(!infect_check) && time_step < time_limit){  
+    
+    # identify susceptible nodes
+    sus_nodes <- net_sim %>% activate(edges) %>%
+      filter(discordant) %>%
+      mutate(susceptible = from*to_infected+to*from_infected) %>%
+      pull(susceptible)
+      
+    # flip coin for all susceptible nodes
+    # nodes which are susceptible to infection from more than one neighbor get separate coin flips
+    # for each neighbor
+    new_infected <- sus_nodes[sample(c(T,F), 
+                                     length(sus_nodes), 
+                                     replace = T, 
+                                     prob=c(infection_prob,1-infection_prob))]
+    
+    # update graph object with newly infected individuals
+    net_sim <- net_sim %>% 
+      activate(nodes) %>%
+      mutate(infected = ifelse(node_id %in% new_infected,TRUE,infected)) %>%
+      mutate(time_infected = ifelse(node_id %in% new_infected,time_step,time_infected)) %>%
+      activate(edges) %>%
+      mutate(from_infected = .N()$infected[from]) %>%
+      mutate(to_infected = .N()$infected[to]) %>%
+      mutate(discordant = from_infected != to_infected)
+    
+    # update stopping criteria and time step
+    infect_check <- net_sim %>% 
+      activate(nodes) %>%
+      pull(infected)
+    time_step = time_step + 1
+  }
+  
+  net_sim <- net_sim %>%
+    activate(edges) %>%
+    dplyr::select(-c(from_infected, to_infected, discordant))
+  
+  return(list(net_sim = net_sim, source_id = source_id, infection_prob = infection_prob, time_steps = time_step))
+}
+
+out <- sim_SI_discrete(net_er, 14, infection_prob = 0.05)
+
+out$net_sim %>% activate(nodes) %>% as_tibble()
+out$net_sim %>% activate(edges) %>% as_tibble()
+
+max_time <- max(out$net_sim %>% activate(nodes) %>% pull(time_infected))+1
+# step through time
+for (i in seq(from=1, max_time, length.out=15)){
+gr <- ggraph(out$net_sim, layout = "kk") +
+  geom_edge_link() +
+  geom_node_point(aes(color=time_infected<i), size = 6) +
+  theme_void()
+print(gr)
+}
+```
+
+Continuous sim as a function - no discrete time steps. MUCH MUCH faster. currently only supports single source. Infection times readily interpreted.
+```{r}
+sim_sI_continuous <- function(net, source_id, infection_rate=1){
+  
+  net_sim <- net %>%
+    activate(nodes) %>%
+    mutate(node_id = 1:(nrow(.N()))) %>%
+    mutate(infected=FALSE) %>%
+    mutate(infected=ifelse(node_id %in% source_id,TRUE,infected)) %>%
+    activate(edges) %>%
+    mutate(transmission_time = rexp(nrow(.E()), rate = infection_rate)) %>%
+    activate(nodes) %>%
+    mutate(time_infected = as.numeric(distances(.,v=source_id, to=V(.), weights = E(.)$transmission_time)))%>%
+    mutate(infected = ifelse(time_infected>=0,TRUE,FALSE))
+  
+  
+  return(list(net_sim = net_sim, source_id = source_id, infection_rate = infection_rate))
+}
+
+out <- sim_sI_continuous(net_er, c(14), infection_rate= 1)
+
+out$net_sim %>% activate(nodes) %>% as_tibble()
+out$net_sim %>% activate(edges) %>% as_tibble()
+
+max_time <- max(out$net_sim %>% activate(nodes) %>% pull(time_infected))+1
+# step through time
+for (i in seq(from=1, max_time, length.out=15)){
+gr <- ggraph(out$net_sim, layout = "kk") +
+  geom_edge_link() +
+  geom_node_point(aes(color=time_infected<i), size = 6) +
+  theme_void()
+print(gr)
+}
+```
+Comparing computational cost of discrete and continuous sim.
+```{r}
+library(microbenchmark)
+
+results <- microbenchmark(
+  `discrete` = sim_SI_discrete(net_er,14),
+  `continuous` = sim_sI_continuous(net_er,14),
+  times=100
+)
+
+results
+plot(results)
+
+```
+
+
+

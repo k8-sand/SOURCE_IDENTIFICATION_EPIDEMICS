@@ -1,0 +1,280 @@
+---
+title: "SIAS Explained"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(igraph)
+library(ggraph)
+library(NetOrigin)
+```
+
+The basic goal of the SIAS algorithm is to (1) estimate the likelihood of a specific node being the source and (2) use Monte Carlo integration to evaluate those likelihoods. After this finding the source is a matter of finding the index of the max in a list of likelihoods. Before we begin attempting to code this algorithm up, we need data. So we are going to generate a graph and simulate a propogation (For now I will use Kate's data).
+
+```{r get_data}
+# use kates script to generate data
+load(file="kate_graph.rData")
+G <- graph.data.frame(el,F)
+
+load(file="kate_graph_times.rData")
+n <- length(time.to.infection$time.infected)
+```
+
+Next we are going to set up the hyper parameters of the algorithm. We will use the paper's initial settings for now: $\alpha_{ij}\sim Uniform(0,20)$ and $\beta_i\sim Uniform(0,100)$. The observers will be selected randomly for now. Also everyone will be treated as a potential source node.
+
+```{r hyper}
+set.seed(42) # set seed for repeatability
+
+candidates <- seq(1,n)
+observers <- sample(1:n,10)
+
+# starting with an n^2 and turning it into an nxn matrix
+alpha_ij <- matrix(runif(n*n,0,20),n,n)
+
+beta_i <- runif(10,0,100)
+```
+
+Finally we need the infection times of the chosen observers and the number of samples we plan to take for the monte carlo integration.
+```{r ob_ti}
+t.l <- time.to.infection[observers,2][[1]]
+L <- 5
+```
+
+Okay, let's get started on coding up the algorithm. For reference the algorithm is below:
+\begin{center}
+\includegraphics[width=0.5\textwidth,height=\textheight]{SIAS.png}
+\end{center}
+
+The first step is to sample $L$ sets of transmission times. Earlier in the paper they introduce the pdf for the transmission times as
+
+\[f(\tau_{ij};\alpha_{ij}) = \frac{1}{\alpha_{ij}}e^{-\frac{\tau_{ij}}{\alpha_{ij}}}\]
+
+where $\tau_{ij} = t^A_i - t^A_j$ is the difference between the $i$th and $j$th asymptomatic times or the transmision time. To sample from this distribution, we invert the cdf
+
+\begin{align*}
+u = F(\tau_{ij};\alpha_{ij}) &= 1 - e^{-\frac{\tau_{ij}}{\alpha_{ij}}}\\
+1- u &= e^{-\frac{\tau_{ij}}{\alpha_{ij}}}\\
+-\alpha_{ij}\log(1- u) &= \tau_{ij}
+\end{align*}
+
+Now we can sample uniform(0,1) random variables and use the inverted cdf to sample transmission times, keeping in mind that we need L sets.
+
+```{r step_1}
+# below is the code version of the inverted cdf we just found
+invF.tau <- function(alpha,u){
+  -alpha * log(1-u)
+}
+
+# we need L sets of transmission times for each edge
+# with igraph we can get the amount of edges
+e <- length(E(G))
+
+# now we can set up an empty array
+tau.l <- array(0, c(L, e) )
+
+# Then we setup a double loop and fill the array
+for (l in 1:L) {
+  for(i in 1:e){
+    # access a specific edge
+    edge <- E(G)[[i]]
+    # head/tail_of functions are used to get the associated nodes of the
+    # edge
+    tau.l[l,i] <- invF.tau(alpha_ij[head_of(G,edge),tail_of(G,edge)],
+                           runif(1))
+  }
+}
+```
+
+For the second step, we need to utilize equation (7) in the paper, which is below:
+
+\[(t^A_i)^l = \min_{q\in Q_i(s)}\sum_{(j,n)\in q}(\tau_{jn})^l + t^A_s\]
+
+where $Q_i(s)$ is the set of paths from node $s$ to node $i$ and $t^A_s$ is the aymptomatic time of the potential source node which is set to 0 for this step. So we just need the shortest weighted path from $s$ to $i$ where the transmission times from step 1 are the weights. Also while the paper does not mention it, we only need to do this for the observed nodes as we will see in future steps. First we need to code up equation (7), which is a lot easier than it looks using igraph.
+
+```{r eq7}
+# inputs are the graph, the transmission times as weights, the
+# observer node in question and the proposed source node
+eq7 <- function(G,weights,o,s){
+  # obviously if they are the same, the path length is 0
+  if(s==o){return(0)}
+  
+  val <- 0 # set up summation variable
+  E(G)$weights <- weights # set weights
+  # use igraph to find shortest path
+  path <- shortest_paths(G,s,o,weights=weights,output="epath",
+                         mode="all")$epath[[1]]
+  # loop through each edge and sum up the weights
+  l <- length(path)
+  for(i in 1:l){
+    edge <- path[[i]]
+    val = val + edge$weights
+  }
+  return(val)
+}
+```
+
+Now we can finish up step 2
+
+```{r step_2}
+# empty array to carry values
+t.A_s <- array(0, c(L, length(observers), n))
+
+# this time its a triple loop since we need to loop through candidate
+# sources as well
+for (l in 1:L) {     
+  # Use Eq 7 to calc asymptomatic times assuming t.A_s = 0
+  # for all nodes w.r.t to  each s
+  for(s in candidates){
+    for(i in 1:length(observers)){
+      o <- observers[[i]]
+      t.A_s[l,i,s] <- sum(eq7(G,tau.l[l,],o,s))
+    }
+  }
+}
+```
+
+The paper states that the likelihood is split into pieces by the change points. This is because as $t^A_s$ for a candidate source node $s$ increases, the incubation time becomes negative for the observer nodes, which is undefined for the exponential distribution. This exactly occurs at the change points we're about to calculate. Moving on to step 3, finding the change points is simple enough: just subtraction.
+
+```{r step_3}
+# empty array to store values
+c.p.s <- array(0, c(L, length(observers), n))
+
+# another triple loop as we need to check each particular
+# asymptomatic time
+for (l in 1:L) {
+  for(s in candidates){
+    for(i in 1:length(observers)){
+      # compute change points for observed nodes
+      if(t.l[[i]] > t.A_s[l,i,s]){
+        c.p.s[l,i,s] <- t.l[[i]] - t.A_s[l,i,s]
+      }
+    }
+  }
+}
+```
+
+Now we are on what is essentially the final step: Calculating the likelihood for each candidate node. Afterwards would be a simple 1D maximization. In this endeavor we are going to need $\phi_L$ which is described in equation (6) in the paper. Here it is below
+
+\[\phi_L(t^A_s) = \frac{1}{L}\sum_{i=1}^L\prod_{i\in O}p(t^I_i|(t^A_i)^l)\]
+
+where $p(\cdot)$ here refers to the pdf for the incubation time mentioned earlier in the paper
+
+\[f(\psi_{i};\beta_{i}) = \frac{1}{\beta_{i}}e^{-\frac{\psi_{i}}{\beta_{i}}}\]
+
+where $\psi_i = t^I_i - t^A_i$ is the incubation time for node $i$. Coding these up, we have
+
+```{r phi_l}
+# pdf for incubation time
+# psi is the incubation time calculated as mentioned above
+# beta is the incubation parameter set at the beginning
+f_inc <- function(psi, beta){
+  (1/beta)*exp(-psi/beta)
+}
+
+
+# this time psi is a Lxn matrix of incubation times
+# and betas is the nx1 vector of beta values
+phi.L <- function(L, psi,betas){
+  val <- 0 # summation variable
+  # calculate mean gradually via loop
+  for(l in 1:L){
+    prob <- 1
+    # calculate product of the pdfs gradually via a loop
+    for(i in 1:length(betas)){
+      if(psi[l,i] >= 0){ # pdf only valid on (0,Inf)
+        prob <- prob * f_inc(psi[l,i],betas[[i]])
+      }
+    }
+    # here we use incremental averaging to calculate the mean
+    # mean_{i+1} <- mean_i + (1/i)*(curr_val - mean_i)
+    val <- val + (1/l)*(prob - val)
+  }
+  return(val)
+}
+```
+
+The paper states that the maximum of each piece is at the right end change point, which means that we simply need to evaluate the likelihood at each change point. Now we can complete the final step using a simple maximization process.
+
+```{r final_step}
+# for each node get the right end change point
+
+omax_s <- -Inf # placeholder for overal maximum likelihood value
+omax_s.i <- 0 # placeholder for overall most likely source node
+for(s in candidates){ # loop through candidates
+  cps <- c.p.s[,,s] # get changepoints
+  
+  # make a list starting with the smallest change points
+  # these will be the t^A_s values we wil be evaluating at
+  t.A0.s <- sort(unique(as.vector(cps))) 
+  
+  max.s <- -Inf # another placeholder for inner max
+  for(tas in t.A0.s){ # loop through t^A_s values
+    # remember psi = t^I_i - t^A_i and
+    # t^A_i = C(not depending on s) + t^A_s
+    # since the change points were calculated with t^A_s=0,
+    # cps = t^I_i - C(not depending on s)
+    # so by doing cps-tas, we get the change point evaluated
+    # at t^A_s = tas which is what we want
+    val <- phi.L(L,cps-tas,beta_i)
+    if(val > max.s){max.s <- val} # replace placeholder if max found
+  }
+  if(max.s > omax_s){# replace placeholder if max found
+    omax_s <- max.s
+    omax_s.i <- s
+  }
+}
+omax_s.i
+```
+
+With that we have our estimated source. Below is the full SIAS function:
+
+```{r SIAS}
+# Alg requires
+# graph G
+# first symptom times of observed nodes where Inf means not infected
+# transmission and transition rates (this are sampled from uniform dist)
+# L: number of samples to take
+SIAS <- function(G,t.l,alpha_ij,beta_i,L,n,candidates,observers){
+  tau.l <- array(0, c(L, length(E(G))) )
+  t.A_s <- array(0, c(L, length(observers), n))
+  c.p.s <- array(0, c(L, length(observers), n))
+  for (l in 1:L) {
+    # sample L sets of transmission times
+    # these will be the weights of the graphs
+    for(i in 1:length(E(G))){
+        edge <- E(G)[[i]]
+        tau.l[l,i] <- invF.tau(alpha_ij[head_of(G,edge),tail_of(G,edge)],runif(1))
+    }     
+    
+    # Use Eq 7 to calc infection times assuming t.A_s = 0 for all nodes w.r.t to  each s
+    for(s in candidates){
+      for(i in 1:length(observers)){
+        o <- observers[[i]]
+        t.A_s[l,i,s] <- sum(eq7(G,tau.l[l,],o,s))
+        # compute change points for observed nodes
+        if(t.l[[i]] > t.A_s[l,i,s]){
+          c.p.s[l,i,s] <- t.l[[i]] - t.A_s[l,i,s]
+        }
+      }
+    }
+  }
+  # for each node get the right end change point
+  omax_s <- -Inf
+  omax_s.i <- 0
+  for(s in candidates){
+    cps <- c.p.s[,,s]
+    t.A0.s <- sort(unique(as.vector(cps)))
+    max.s <- -Inf
+    for(tas in t.A0.s){
+      val <- phi.L(L,cps-tas,beta_i)
+      if(val > max.s){max.s <- val}
+    }
+    if(max.s > omax_s){
+      omax_s <- max.s
+      omax_s.i <- s
+    }
+  }
+  return(t.A_s)
+}
+```
